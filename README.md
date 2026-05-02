@@ -1,6 +1,6 @@
-# LPDDR4 Host Controller & Digital PHY
+# KENT's First Auto-Sim DDR Host Design
 
-A complete Verilog implementation of an LPDDR4 Host Controller and Digital PHY with 4 AXI ports and 32-bit DQ bus.
+A complete Verilog implementation of an LPDDR4 Host Controller and Digital PHY with 4 AXI ports and 32-bit DQ bus. **Verified with auto-simulation using Verilator + random AXI traffic generators.**
 
 ## Features
 

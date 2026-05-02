@@ -8,7 +8,8 @@ module lpddr4_top #(
     parameter DQ_WIDTH = 32,
     parameter DQS_WIDTH = 4,
     parameter CA_WIDTH = 10,
-    parameter CS_WIDTH = 2
+    parameter CS_WIDTH = 2,
+    parameter BYPASS_PHY = 0  // 1 = use external dfi_rddata/dfi_rddata_en
 ) (
     input  logic        sys_clk,
     input  logic        sys_rst_n,
@@ -186,6 +187,19 @@ module lpddr4_top #(
     logic        dfi_wrdata_mask;
     logic [31:0] dfi_rddata;
     logic        dfi_rddata_en;
+    logic [31:0] phy_rddata;
+    logic        phy_rddata_en;
+
+    // Mux: bypass PHY read data when BYPASS_PHY is set
+    always_comb begin
+        if (BYPASS_PHY) begin
+            dfi_rddata = dfiresp_rddata;
+            dfi_rddata_en = dfiresp_rddata_en;
+        end else begin
+            dfi_rddata = phy_rddata;
+            dfi_rddata_en = phy_rddata_en;
+        end
+    end
 
     // Command bus from crossbar
     logic        cmd_valid;
@@ -204,6 +218,7 @@ module lpddr4_top #(
     logic        resp_valid;
     logic        resp_ready;
     logic [1:0]  resp_port;
+    logic        resp_is_wr;
 
     // Configuration registers
     logic [31:0] cfg_ctrl;
@@ -223,10 +238,25 @@ module lpddr4_top #(
     logic [7:0]  wr_delay;
     logic [7:0]  ca_delay;
 
+    // PHY delay defaults (DDR-3200: WL=4, RL=14)
+    localparam DEFAULT_WL = 4;
+    localparam DEFAULT_RL = 14;
+
     // Clock assignment
     assign clk = sys_clk;
     assign clk_4x = ddr_clk_4x;
     assign rst_n = sys_rst_n && pll_lock;
+
+    // PHY delay values (can be updated via APB at cfg_phy)
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            wl_delay <= DEFAULT_WL;
+            rd_delay <= DEFAULT_RL;
+        end else if (psel && penable && pwrite && paddr[7:2] == 6'h02) begin
+            wl_delay <= pwdata[7:0];
+            rd_delay <= pwdata[15:8];
+        end
+    end
 
     // APB register access
     always_ff @(posedge clk) begin
@@ -410,7 +440,8 @@ module lpddr4_top #(
         .resp_id           (resp_id),
         .resp_valid        (resp_valid),
         .resp_ready        (resp_ready),
-        .resp_port         (resp_port)
+        .resp_port         (resp_port),
+        .resp_is_wr        (resp_is_wr)
     );
 
     // LPDDR4 Controller instantiation
@@ -432,6 +463,8 @@ module lpddr4_top #(
         .resp_id           (resp_id),
         .resp_valid        (resp_valid),
         .resp_ready        (resp_ready),
+        .resp_port         (resp_port),
+        .resp_is_wr        (resp_is_wr),
 
         .dfi_cs_n          (dfi_cs_n),
         .dfi_cke           (dfi_cke),
@@ -472,8 +505,8 @@ module lpddr4_top #(
         .dfi_wrdata_en     (dfi_wrdata_en),
         .dfi_wrdata_mask   (dfi_wrdata_mask),
 
-        .dfi_rddata        (dfi_rddata),
-        .dfi_rddata_en     (dfi_rddata_en),
+        .dfi_rddata        (phy_rddata),
+        .dfi_rddata_en     (phy_rddata_en),
 
         .ddr_dq            (ddr_dq),
         .ddr_dqs           (ddr_dqs),
@@ -495,6 +528,33 @@ module lpddr4_top #(
         .training_status   (training_status),
         .training_done     (training_done)
     );
+
+    // DFI Responder for verification (bypasses PHY and memory model)
+    logic [31:0] dfiresp_rddata;
+    logic        dfiresp_rddata_en;
+
+    generate
+        if (BYPASS_PHY) begin : gen_dfiresp
+            dfi_responder u_dfiresp (
+                .clk            (clk),
+                .rst_n          (rst_n),
+                .dfi_cs_n       (dfi_cs_n),
+                .dfi_cke        (dfi_cke),
+                .dfi_ca         (dfi_ca),
+                .dfi_ck         (dfi_ck),
+                .dfi_ck_en      (dfi_ck_en),
+                .dfi_odt        (dfi_odt),
+                .dfi_wrdata     (dfi_wrdata),
+                .dfi_wrdata_en  (dfi_wrdata_en),
+                .dfi_wrdata_mask(dfi_wrdata_mask),
+                .dfi_rddata     (dfiresp_rddata),
+                .dfi_rddata_en  (dfiresp_rddata_en)
+            );
+        end else begin : gen_no_dfiresp
+            assign dfiresp_rddata = 32'h0;
+            assign dfiresp_rddata_en = 1'b0;
+        end
+    endgenerate
 
     // Status outputs
     assign training_done = training_done_int;

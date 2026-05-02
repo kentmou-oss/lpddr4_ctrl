@@ -21,6 +21,8 @@ module lpddr4_controller (
     output logic [4:0]  resp_id,  // 5-bit for outstanding reads
     output logic        resp_valid,
     input  logic        resp_ready,
+    output logic [1:0]  resp_port,
+    output logic        resp_is_wr,
 
     // DFI interface to PHY
     output logic        dfi_cs_n,
@@ -107,10 +109,16 @@ module lpddr4_controller (
     localparam ROB_DEPTH = 32;
     logic [127:0] rob_rdata   [ROB_DEPTH];
     logic [4:0]  rob_id       [ROB_DEPTH];
+    logic [1:0]  rob_port     [ROB_DEPTH];
     logic        rob_valid    [ROB_DEPTH];
     logic [$clog2(ROB_DEPTH)-1:0] rob_head;
     logic [$clog2(ROB_DEPTH)-1:0] rob_tail;
     logic [4:0]  rob_pending_id;  // ID of in-flight read
+
+    // Write response tracking
+    logic        wr_resp_pending;
+    logic [4:0]  wr_resp_id;
+    logic [1:0]  wr_resp_port;
 
     // Mode registers
     logic [7:0] mr [64];
@@ -179,15 +187,18 @@ module lpddr4_controller (
             end
 
             CTRL_READ: begin
-                if (burst_active && dfi_rddata_en)
-                    next_state = CTRL_READ;
-                else if (!burst_active && timer_done)
+                // Stay until burst completes; state_d check prevents premature exit
+                if (state_d == CTRL_READ && !burst_active)
                     next_state = CTRL_IDLE;
+                else
+                    next_state = CTRL_READ;
             end
 
             CTRL_WRITE: begin
-                if (!burst_active && timer_done)
+                if (state_d == CTRL_WRITE && !burst_active && wr_burst_done)
                     next_state = CTRL_IDLE;
+                else
+                    next_state = CTRL_WRITE;
             end
 
             CTRL_PRECHARGE: begin
@@ -199,13 +210,16 @@ module lpddr4_controller (
         endcase
     end
 
-    // Timer logic
+    // Timer logic - uses one-shot timer_start to load timer
+    logic timer_start_d;
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             timer <= 16'h0;
             timer_done <= 1'b0;
+            timer_start_d <= 1'b0;
         end else begin
-            if (timer_start) begin
+            // Edge detection: load timer only on rising edge of timer_start
+            if (timer_start && !timer_start_d) begin
                 timer <= cfg_timing[15:0];
                 timer_done <= 1'b0;
             end else if (timer > 0) begin
@@ -214,6 +228,7 @@ module lpddr4_controller (
             end else begin
                 timer_done <= 1'b0;
             end
+            timer_start_d <= timer_start;
         end
     end
 
@@ -267,7 +282,10 @@ module lpddr4_controller (
                 q_wr_ptr <= q_wr_ptr + 1;
             end
 
-            if (!q_empty && !burst_active && resp_ready) begin
+            // Dequeue when write response handled or read data accepted
+            if (!q_empty && !burst_active &&
+                ((q_wr[q_rd_ptr] && wr_resp_pending && resp_ready) ||
+                 (!q_wr[q_rd_ptr] && resp_valid && resp_ready))) begin
                 q_valid[q_rd_ptr] <= 1'b0;
                 q_rd_ptr <= q_rd_ptr + 1;
             end
@@ -276,46 +294,55 @@ module lpddr4_controller (
 
     assign cmd_ready = ~q_full;
 
-    // Address decode
+    // Address decode - use current queue entry
     always_comb begin
-        chip_sel = cmd_addr[27:26];
-        bank_addr = {cmd_addr[22], cmd_addr[16:15]};  // BA1, BA0
-        row_addr  = cmd_addr[17:4];
-        col_addr  = {cmd_addr[12:3], 3'b0};  // BL16 aligned
+        chip_sel = q_addr[q_rd_ptr][27:26];
+        bank_addr = {q_addr[q_rd_ptr][22], q_addr[q_rd_ptr][16:15]};  // BA1, BA0
+        row_addr  = q_addr[q_rd_ptr][17:4];
+        col_addr  = {q_addr[q_rd_ptr][12:3], 3'b0};  // BL16 aligned
     end
 
-    // DFI command generation
+    // DFI command generation with proper LPDDR4 CA encoding
+    // CA[9]   = 0 for valid command, 1 for NOP
+    // CA[8:7] = upper addr bits (row[13:12] for ACT, col[9:8] for RD/WR)
+    // CA[6]   = BA[2] (bank address MSB)
+    // CA[5:2] = {ACT_n, RAS_n, CAS_n, WE_n} (active-low command bits)
+    // CA[1:0] = BA[1:0] (bank address LSBs)
+    // Total: 1+2+1+4+2 = 10 bits
     always_comb begin
         dfi_cs_n   = 2'b11;  // Deselect
         dfi_cke    = 2'b11;
-        dfi_ca     = 10'h3FF;  // NOP
+        dfi_ca     = 10'h3FF;  // NOP (all ones)
         dfi_ck     = 1'b1;
-        dfi_ck_en  = 1'b1;  // Always keep CK enabled
+        dfi_ck_en  = 1'b1;
         dfi_odt    = 2'b00;
         timer_start = 1'b0;
         ref_ack = 1'b0;
 
         case (state)
             CTRL_INIT_WAIT: begin
-                dfi_cs_n = 2'b01;  // Assert CS to start init
+                dfi_cs_n = 2'b01;
+                dfi_ca = 10'h3FF;  // DES
                 timer_start = 1'b1;
             end
 
             CTRL_INIT_MR: begin
                 dfi_cs_n = 2'b00;
-                dfi_ca = {2'b0, 1'b0, mr[2][5:0]};  // MR2
+                // MRS: valid=0, CA[5:2]=0000
+                dfi_ca = {2'b00, 2'b00, 1'b0, 4'b0000, 1'b0};
                 timer_start = 1'b1;
             end
 
             CTRL_INIT_ZQCAL: begin
-                dfi_cs_n = 2'b01;  // CS[0]
-                dfi_ca = {2'b00, 1'b0, 6'h2A};  // ZQ calibration start
+                dfi_cs_n = 2'b01;
+                dfi_ca = {2'b00, 2'b00, 1'b0, 4'b0001, 1'b0};
                 timer_start = 1'b1;
             end
 
             CTRL_REFRESH: begin
                 dfi_cs_n = 2'b00;
-                dfi_ca = {2'b00, 1'b0, 5'b00011};  // REF
+                // REF: valid=0, CA[5:2]=0001
+                dfi_ca = {2'b00, 2'b00, 1'b0, 4'b0001, 1'b0};
                 timer_start = 1'b1;
                 ref_ack = 1'b1;
             end
@@ -323,27 +350,31 @@ module lpddr4_controller (
             CTRL_ACTIVATE: begin
                 dfi_cs_n = ~(1 << chip_sel);
                 dfi_cke = 2'b11;
-                dfi_ca = {row_addr[13:8], 1'b1, row_addr[7:0], 1'b0, 1'b1};  // ACT
+                // ACT: valid=0, addr=row[13:12], BA2, cmd=0011, BA[1:0]
+                dfi_ca = {1'b0, row_addr[13:12], bank_addr[2], 4'b0011, bank_addr[1:0]};
                 timer_start = 1'b1;
             end
 
             CTRL_READ: begin
                 dfi_cs_n = ~(1 << chip_sel);
                 dfi_cke = 2'b11;
-                dfi_ca = {col_addr[10:7], 1'b0, bank_addr, 1'b0, col_addr[6:3], 1'b0, 2'b01};  // READ
+                // READ: valid=0, addr=col[9:8], BA2, cmd=1101, BA[1:0]
+                dfi_ca = {1'b0, col_addr[9:8], bank_addr[2], 4'b1101, bank_addr[1:0]};
                 timer_start = 1'b1;
             end
 
             CTRL_WRITE: begin
                 dfi_cs_n = ~(1 << chip_sel);
                 dfi_cke = 2'b11;
-                dfi_ca = {col_addr[10:7], 1'b0, bank_addr, 1'b0, col_addr[6:3], 1'b0, 2'b00};  // WRITE
+                // WRITE: valid=0, addr=col[9:8], BA2, cmd=1100, BA[1:0]
+                dfi_ca = {1'b0, col_addr[9:8], bank_addr[2], 4'b1100, bank_addr[1:0]};
                 timer_start = 1'b1;
             end
 
             CTRL_PRECHARGE: begin
                 dfi_cs_n = 2'b00;
-                dfi_ca = {4'b0, 1'b0, bank_addr, 1'b0, 2'b01};  // PRE
+                // PRE: valid=0, cmd=1010
+                dfi_ca = {1'b0, 2'b00, bank_addr[2], 4'b1010, bank_addr[1:0]};
                 timer_start = 1'b1;
             end
 
@@ -355,42 +386,86 @@ module lpddr4_controller (
         endcase
     end
 
-    // Burst handling for writes
+    // Burst handling for writes and reads
+    // 128-bit AXI data serialized to 32-bit DFI (4 DFI beats per AXI word)
+    logic [7:0] axi_beat_cnt;  // remaining AXI beats (128-bit)
+    logic [2:0] dfi_sub_cnt;   // sub-beat within AXI word (0-3, 32-bit each)
+    logic       wr_burst_done; // prevent write burst restart after completion
+
+    // Detect state transitions for burst initialization
+    logic [7:0] state_d;
+    always_ff @(posedge clk) state_d <= state;
+
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             burst_cnt <= 8'h0;
             burst_active <= 1'b0;
             write_buf <= 128'h0;
             write_strb_buf <= 16'h0;
+            axi_beat_cnt <= 8'h0;
+            dfi_sub_cnt <= 3'h0;
+            wr_burst_done <= 1'b0;
+            dfi_wrdata_en <= 1'b0;
+            dfi_wrdata <= 32'h0;
+            read_buf <= 128'h0;
         end else begin
             case (state)
                 CTRL_WRITE: begin
-                    if (!burst_active) begin
-                        burst_cnt <= q_len[q_rd_ptr];
+                    // Start burst only on first cycle entering WRITE (state != previous state)
+                    if (!burst_active && !wr_burst_done) begin
+                        axi_beat_cnt <= q_len[q_rd_ptr];
                         write_buf <= q_wdata[q_rd_ptr];
                         write_strb_buf <= q_wstrb[q_rd_ptr];
+                        dfi_sub_cnt <= 3'd1;  // beat 0 sent this cycle
                         burst_active <= 1'b1;
-                        dfi_wrdata <= q_wdata[q_rd_ptr][31:0];  // First beat
+                        dfi_wrdata <= q_wdata[q_rd_ptr][31:0];
                         dfi_wrdata_en <= 1'b1;
-                    end else if (burst_cnt > 0) begin
-                        burst_cnt <= burst_cnt - 1;
-                        dfi_wrdata <= write_buf[31:0];
-                        dfi_wrdata_en <= 1'b1;
-                        write_buf <= {32'h0, write_buf[127:32]};
-                        write_strb_buf <= {16'h0, write_strb_buf[15:16]};
-                        if (burst_cnt == 1)
-                            burst_active <= 1'b0;
+                    end else if (burst_active) begin
+                        if (dfi_sub_cnt < 3'd4) begin
+                            // Send next 32-bit sub-beat
+                            dfi_wrdata <= write_buf[31:0];
+                            dfi_wrdata_en <= 1'b1;
+                            write_buf <= {32'h0, write_buf[127:32]};
+                            dfi_sub_cnt <= dfi_sub_cnt + 1;
+                        end else begin
+                            // All 4 sub-beats of current AXI word done
+                            dfi_sub_cnt <= 3'd0;
+                            if (axi_beat_cnt > 0) begin
+                                axi_beat_cnt <= axi_beat_cnt - 1;
+                                dfi_sub_cnt <= 3'd1;
+                                dfi_wrdata <= write_buf[31:0];
+                                dfi_wrdata_en <= 1'b1;
+                                write_buf <= {32'h0, write_buf[127:32]};
+                            end else begin
+                                dfi_wrdata_en <= 1'b0;
+                                burst_active <= 1'b0;
+                                wr_burst_done <= 1'b1;
+                            end
+                        end
                     end else begin
                         dfi_wrdata_en <= 1'b0;
                     end
                 end
 
                 CTRL_READ: begin
-                    if (dfi_rddata_en) begin
-                        read_buf <= {dfi_rddata, read_buf[127:32]};
-                        burst_cnt <= burst_cnt - 1;
-                        if (burst_cnt == 1)
-                            burst_active <= 1'b0;
+                    // Start read burst on first cycle entering READ
+                    if (!burst_active && state_d != CTRL_READ) begin
+                        burst_active <= 1'b1;
+                        dfi_sub_cnt <= 3'd0;
+                        axi_beat_cnt <= q_len[q_rd_ptr];
+                    end else if (burst_active) begin
+                        if (dfi_rddata_en) begin
+                            read_buf <= {dfi_rddata, read_buf[127:32]};
+                            dfi_sub_cnt <= dfi_sub_cnt + 1;
+                            if (dfi_sub_cnt == 3'd3) begin
+                                dfi_sub_cnt <= 3'd0;
+                                if (axi_beat_cnt > 0) begin
+                                    axi_beat_cnt <= axi_beat_cnt - 1;
+                                end else begin
+                                    burst_active <= 1'b0;
+                                end
+                            end
+                        end
                     end
                 end
 
@@ -398,17 +473,65 @@ module lpddr4_controller (
                     burst_cnt <= 8'h0;
                     burst_active <= 1'b0;
                     dfi_wrdata_en <= 1'b0;
+                    dfi_wrdata <= 32'h0;
+                    dfi_sub_cnt <= 3'd0;
+                    axi_beat_cnt <= 8'h0;
+                    wr_burst_done <= 1'b0;
                 end
             endcase
         end
     end
 
-    // Read data output - simplified, returns data from head of reorder buffer
-    assign resp_rdata = rob_rdata[rob_head];
-    assign resp_id    = rob_id[rob_head];
-    assign resp_valid = rob_valid[rob_head];
+    // Write response handling
+    // Detect burst_active falling edge for writes and reads
+    logic burst_active_d;
 
-    // Reorder buffer management
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            burst_active_d <= 1'b0;
+        end else begin
+            burst_active_d <= burst_active;
+        end
+    end
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            wr_resp_pending <= 1'b0;
+            wr_resp_id <= 5'h0;
+            wr_resp_port <= 2'h0;
+        end else begin
+            // Set write response when write burst completes (burst_active 1→0 in WRITE state)
+            if (state == CTRL_WRITE && burst_active_d && !burst_active) begin
+                wr_resp_pending <= 1'b1;
+                wr_resp_id <= q_id[q_rd_ptr];
+                wr_resp_port <= q_port[q_rd_ptr];
+            end
+
+            // Clear when AXI accepts the response
+            if (wr_resp_pending && resp_ready) begin
+                wr_resp_pending <= 1'b0;
+            end
+        end
+    end
+
+    // Response output - write response takes priority over read
+    always_comb begin
+        if (wr_resp_pending) begin
+            resp_rdata  = 128'h0;
+            resp_id     = wr_resp_id;
+            resp_valid  = 1'b1;
+            resp_port   = wr_resp_port;
+            resp_is_wr  = 1'b1;
+        end else begin
+            resp_rdata  = rob_rdata[rob_head];
+            resp_id     = rob_id[rob_head];
+            resp_valid  = rob_valid[rob_head];
+            resp_port   = rob_port[rob_head];
+            resp_is_wr  = 1'b0;
+        end
+    end
+
+    // Reorder buffer for reads
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             rob_head <= '0;
@@ -417,16 +540,17 @@ module lpddr4_controller (
                 rob_valid[i] <= 1'b0;
             end
         end else begin
-            // Push read data into ROB when burst completes
-            if (burst_active && (burst_cnt == 0) && !q_wr[q_rd_ptr]) begin
+            // Push read data into ROB when read burst completes
+            if (state == CTRL_READ && burst_active_d && !burst_active) begin
                 rob_rdata[rob_tail] <= read_buf;
                 rob_id[rob_tail]   <= q_id[q_rd_ptr];
+                rob_port[rob_tail] <= q_port[q_rd_ptr];
                 rob_valid[rob_tail] <= 1'b1;
                 rob_tail <= rob_tail + 1;
             end
 
-            // Pop from ROB when AXI accepts response
-            if (resp_ready && rob_valid[rob_head]) begin
+            // Pop from ROB when AXI accepts response (only when no write response pending)
+            if (!wr_resp_pending && resp_ready && rob_valid[rob_head]) begin
                 rob_valid[rob_head] <= 1'b0;
                 rob_head <= rob_head + 1;
             end

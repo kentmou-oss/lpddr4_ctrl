@@ -91,20 +91,20 @@ module lpddr4_model #(
     model_state_t state_machine, next_state;
 
     // ============================================
-    // Timing Parameters (DDR-3200)
+    // Timing Parameters (sys_clk @ 100MHz, tCK=10ns)
     // ============================================
-    localparam tCK     = 2;        // Clock period (ns)
-    localparam tRCD    = 18/tCK;   // RAS to CAS delay
-    localparam tRP     = 18/tCK;   // Precharge to RAS
-    localparam tRAS    = 42/tCK;   // Row active time
-    localparam tRC     = 65/tCK;   // Row cycle time
-    localparam tRL     = 14;        // Read latency (cycles)
-    localparam tWL     = 12;        // Write latency (cycles)
-    localparam tDQSCK  = 5;        // DQS output access
+    localparam tCK     = 10;       // Clock period (ns)
+    localparam tRCD    = 4;        // RAS to CAS delay (cycles)
+    localparam tRP     = 4;        // Precharge to RAS (cycles)
+    localparam tRAS    = 10;       // Row active time (cycles)
+    localparam tRC     = 15;       // Row cycle time
+    localparam tRL     = 14;       // Read latency (cycles)
+    localparam tWL     = 4;        // Write latency (cycles)
+    localparam tDQSCK  = 3;        // DQS output access
     localparam tRPRE   = 1;        // Read DQS preamble
     localparam tWPRE   = 1;        // Write DQS preamble
-    localparam tWTR    = 10/tCK;   // Write to read turnaround
-    localparam tRTP    = 8/tCK;    // Read to precharge
+    localparam tWTR    = 4;        // Write to read turnaround
+    localparam tRTP    = 4;        // Read to precharge
     localparam tCCD    = 4;        // CAS to CAS delay
 
     // ============================================
@@ -223,16 +223,16 @@ module lpddr4_model #(
                 STATE_ACTIVE: begin
                     if (timer > 0) begin
                         // Waiting for tRCD
-                    end else if (cmd_valid && !cmd_act_n && cmd_ras_n && !cmd_cas_n && cmd_we_n) begin
-                        // READ command
-                        timer <= tRL + 4;  // Read latency + some cycles
+                    end else if (cmd_valid && cmd_act_n && cmd_ras_n && !cmd_cas_n && cmd_we_n) begin
+                        // READ command: ACT_n=1, RAS_n=1, CAS_n=0, WE_n=1
+                        timer <= tRL + 4;
                         state_machine <= STATE_READING;
-                    end else if (cmd_valid && !cmd_act_n && cmd_ras_n && cmd_cas_n && !cmd_we_n) begin
-                        // WRITE command
-                        timer <= tWL + 4;  // Write latency + some cycles
+                    end else if (cmd_valid && cmd_act_n && cmd_ras_n && !cmd_cas_n && !cmd_we_n) begin
+                        // WRITE command: ACT_n=1, RAS_n=1, CAS_n=0, WE_n=0
+                        timer <= tWL + 4;
                         state_machine <= STATE_WRITING;
-                    end else if (cmd_valid && !cmd_act_n && !cmd_ras_n && cmd_cas_n && cmd_we_n) begin
-                        // PRECHARGE
+                    end else if (cmd_valid && cmd_act_n && !cmd_ras_n && cmd_cas_n && !cmd_we_n) begin
+                        // PRECHARGE: ACT_n=1, RAS_n=0, CAS_n=1, WE_n=0
                         open_bank[cmd_bank] <= 0;
                         timer <= tRP;
                         state_machine <= STATE_PRECHARGING;
@@ -264,8 +264,21 @@ module lpddr4_model #(
             STATE_INIT_ZQCAL: if (timer == 0) begin
                                 next_state = STATE_IDLE;
                               end
-            STATE_IDLE:       next_state = STATE_ACTIVE;
-            STATE_ACTIVE:     if (timer == 0) next_state = STATE_ACTIVE;
+            STATE_IDLE: begin
+                // Only transition on a valid command
+                if (cmd_valid) begin
+                    if (!cmd_act_n && !cmd_ras_n && cmd_cas_n && cmd_we_n)
+                        next_state = STATE_ACTIVE;  // ACT
+                    else
+                        next_state = STATE_IDLE;
+                end else begin
+                    next_state = STATE_IDLE;
+                end
+            end
+            STATE_ACTIVE: begin
+                if (timer == 0) next_state = STATE_ACTIVE;
+                else next_state = STATE_ACTIVE;
+            end
             STATE_READING:    if (timer == 0) next_state = STATE_ACTIVE;
             STATE_WRITING:    if (timer == 0) next_state = STATE_ACTIVE;
             STATE_PRECHARGING: if (timer == 0) next_state = STATE_IDLE;
@@ -284,17 +297,38 @@ module lpddr4_model #(
         col_addr = cmd_addr[10:0];  // Column address
     end
 
-    // Memory read
+    // Memory read — load data as soon as READ command is detected
     always_ff @(posedge clk) begin
-        if (state_machine == STATE_READING && timer == 1) begin
-            // Read data appears after RL cycles
+        if (state_machine == STATE_ACTIVE && timer == 1 && cmd_valid && cmd_act_n && cmd_ras_n && !cmd_cas_n && cmd_we_n) begin
             automatic integer mem_idx = {bank_addr_reg, open_row[bank_addr_reg], col_addr};
             read_data <= mem[mem_idx];
         end
     end
 
-    // DQ output enable
-    assign dq_out_en = (state_machine == STATE_READING) && (timer <= tRL);
+    // Memory write - capture DQ during write state
+    logic [DQ_WIDTH-1:0] write_data;
+    logic [10:0] write_col_addr;
+    always_ff @(posedge clk) begin
+        if (state_machine == STATE_WRITING && timer >= 2) begin
+            write_data <= ddr_dq;
+            write_col_addr <= col_addr;
+        end
+        if (state_machine == STATE_WRITING && timer == 2) begin
+            automatic integer mem_idx = {bank_addr_reg, open_row[bank_addr_reg], write_col_addr};
+            mem[mem_idx] <= write_data;
+        end
+    end
+
+    // DQ output enable — active during READING state
+    logic read_pending;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) read_pending <= 1'b0;
+        else if (state_machine == STATE_ACTIVE && timer == 1 && cmd_valid && cmd_act_n && cmd_ras_n && !cmd_cas_n && cmd_we_n)
+            read_pending <= 1'b1;
+        else if (state_machine == STATE_IDLE)
+            read_pending <= 1'b0;
+    end
+    assign dq_out_en = (state_machine == STATE_READING) || read_pending;
     assign dq_out = read_data;
 
     // ============================================

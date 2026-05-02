@@ -145,7 +145,8 @@ module axi_crossbar (
     input  logic [4:0]  resp_id,  // 5-bit for outstanding reads
     input  logic        resp_valid,
     output logic        resp_ready,
-    input  logic [1:0]  resp_port
+    input  logic [1:0]  resp_port,
+    input  logic        resp_is_wr
 );
     localparam NUM_PORTS = 4;
 
@@ -165,22 +166,26 @@ module axi_crossbar (
     assign port_req[3] = m3_axi_awvalid | m3_axi_arvalid;
 
     // Round-robin arbitration
+    // Increment only when a command is actually accepted (valid & ready)
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             arb_rr <= 2'b0;
-        end else if (cmd_ready) begin
+        end else if (cmd_valid && cmd_ready) begin
             arb_rr <= arb_rr + 1;
         end
     end
 
-    // Priority encoder with round-robin
-    logic [NUM_PORTS-1:0] rot_req;
+    // Priority encoder with round-robin (first requesting port in RR order wins)
+    logic found;
     always_comb begin
-        rot_req = {port_req, port_req} << arb_rr;
         grant_enc = 2'b00;
-        for (int i = 0; i < NUM_PORTS*2; i++) begin
-            if (rot_req[i]) begin
-                grant_enc = (i < NUM_PORTS) ? i[1:0] : i[1:0] - NUM_PORTS[1:0];
+        found = 1'b0;
+        // Iterate through ports starting from arb_rr
+        for (int i = 0; i < NUM_PORTS; i++) begin
+            automatic int port_idx = (arb_rr + i) % NUM_PORTS;
+            if (port_req[port_idx] && !found) begin
+                grant_enc = port_idx[1:0];
+                found = 1'b1;
             end
         end
     end
@@ -198,6 +203,17 @@ module axi_crossbar (
     assign m1_axi_awready = port1_granted && cmd_ready && m1_axi_awvalid;
     assign m2_axi_awready = port2_granted && cmd_ready && m2_axi_awvalid;
     assign m3_axi_awready = port3_granted && cmd_ready && m3_axi_awvalid;
+
+    assign m0_axi_arready = port0_granted && cmd_ready && m0_axi_arvalid;
+    assign m1_axi_arready = port1_granted && cmd_ready && m1_axi_arvalid;
+    assign m2_axi_arready = port2_granted && cmd_ready && m2_axi_arvalid;
+    assign m3_axi_arready = port3_granted && cmd_ready && m3_axi_arvalid;
+
+    // W channel ready - accept write data when port is granted and command accepted
+    assign m0_axi_wready = port0_granted && cmd_ready && m0_axi_wvalid;
+    assign m1_axi_wready = port1_granted && cmd_ready && m1_axi_wvalid;
+    assign m2_axi_wready = port2_granted && cmd_ready && m2_axi_wvalid;
+    assign m3_axi_wready = port3_granted && cmd_ready && m3_axi_wvalid;
 
     // Simplified crossbar - single cycle throughput
     // In a real implementation, this would have proper muxing
@@ -277,57 +293,104 @@ module axi_crossbar (
         endcase
     end
 
-    // Response routing - uses resp_id from controller for reads
+    // Outstanding command tracker (small FIFO, depth 8 matches controller queue)
+    localparam TRACK_DEPTH = 8;
+    logic [1:0] track_port [TRACK_DEPTH];
+    logic       track_wr   [TRACK_DEPTH];
+    logic [4:0] track_id   [TRACK_DEPTH];
+    logic [TRACK_DEPTH-1:0] track_valid;
+    logic [$clog2(TRACK_DEPTH)-1:0] track_wr_ptr;
+    logic [$clog2(TRACK_DEPTH)-1:0] track_rd_ptr;
+    logic track_full;
+    logic track_empty;
+
+    assign track_full  = track_valid[track_wr_ptr] && (track_wr_ptr == track_rd_ptr);
+    assign track_empty = !(|track_valid);
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            track_wr_ptr <= '0;
+            track_rd_ptr <= '0;
+            for (int i = 0; i < TRACK_DEPTH; i++) track_valid[i] <= 1'b0;
+        end else begin
+            // Push when command is issued
+            if (cmd_valid && cmd_ready && !track_full) begin
+                track_port[track_wr_ptr] <= grant_enc;
+                track_wr[track_wr_ptr]   <= cmd_wr;
+                track_id[track_wr_ptr]   <= cmd_id;
+                track_valid[track_wr_ptr] <= 1'b1;
+                track_wr_ptr <= track_wr_ptr + 1;
+            end
+
+            // Pop when response is consumed
+            if (resp_valid && resp_ready && !track_empty) begin
+                track_valid[track_rd_ptr] <= 1'b0;
+                track_rd_ptr <= track_rd_ptr + 1;
+            end
+        end
+    end
+
+    // Response routing - uses controller's resp_port and resp_is_wr directly
     always_comb begin
         resp_ready = 1'b0;
         case (resp_port)
             2'd0: begin
                 m0_axi_bid    = 4'h0;
                 m0_axi_bresp  = 2'b00;
-                m0_axi_bvalid = resp_valid && (cmd_port == 2'd0) && cmd_wr;
-                m0_axi_rid    = resp_id;  // Use resp_id from controller
+                m0_axi_bvalid = resp_valid && resp_is_wr;
+                m0_axi_rid    = resp_id;
                 m0_axi_rdata  = resp_rdata;
                 m0_axi_rresp  = 2'b00;
                 m0_axi_rlast  = 1'b1;
-                m0_axi_rvalid = resp_valid && (cmd_port == 2'd0) && !cmd_wr;
+                m0_axi_rvalid = resp_valid && !resp_is_wr;
                 resp_ready    = (m0_axi_bready && m0_axi_bvalid) ||
                                (m0_axi_rready && m0_axi_rvalid);
             end
             2'd1: begin
                 m1_axi_bid    = 4'h0;
                 m1_axi_bresp  = 2'b00;
-                m1_axi_bvalid = resp_valid && (cmd_port == 2'd1) && cmd_wr;
-                m1_axi_rid    = resp_id;  // Use resp_id from controller
+                m1_axi_bvalid = resp_valid && resp_is_wr;
+                m1_axi_rid    = resp_id;
                 m1_axi_rdata  = resp_rdata;
                 m1_axi_rresp  = 2'b00;
                 m1_axi_rlast  = 1'b1;
-                m1_axi_rvalid = resp_valid && (cmd_port == 2'd1) && !cmd_wr;
+                m1_axi_rvalid = resp_valid && !resp_is_wr;
                 resp_ready    = (m1_axi_bready && m1_axi_bvalid) ||
                                (m1_axi_rready && m1_axi_rvalid);
             end
             2'd2: begin
                 m2_axi_bid    = 4'h0;
                 m2_axi_bresp  = 2'b00;
-                m2_axi_bvalid = resp_valid && (cmd_port == 2'd2) && cmd_wr;
-                m2_axi_rid    = resp_id;  // Use resp_id from controller
+                m2_axi_bvalid = resp_valid && resp_is_wr;
+                m2_axi_rid    = resp_id;
                 m2_axi_rdata  = resp_rdata;
                 m2_axi_rresp  = 2'b00;
                 m2_axi_rlast  = 1'b1;
-                m2_axi_rvalid = resp_valid && (cmd_port == 2'd2) && !cmd_wr;
+                m2_axi_rvalid = resp_valid && !resp_is_wr;
                 resp_ready    = (m2_axi_bready && m2_axi_bvalid) ||
                                (m2_axi_rready && m2_axi_rvalid);
             end
             2'd3: begin
                 m3_axi_bid    = 4'h0;
                 m3_axi_bresp  = 2'b00;
-                m3_axi_bvalid = resp_valid && (cmd_port == 2'd3) && cmd_wr;
-                m3_axi_rid    = resp_id;  // Use resp_id from controller
+                m3_axi_bvalid = resp_valid && resp_is_wr;
+                m3_axi_rid    = resp_id;
                 m3_axi_rdata  = resp_rdata;
                 m3_axi_rresp  = 2'b00;
                 m3_axi_rlast  = 1'b1;
-                m3_axi_rvalid = resp_valid && (cmd_port == 2'd3) && !cmd_wr;
+                m3_axi_rvalid = resp_valid && !resp_is_wr;
                 resp_ready    = (m3_axi_bready && m3_axi_bvalid) ||
                                (m3_axi_rready && m3_axi_rvalid);
+            end
+            default: begin
+                m0_axi_bid = 4'h0; m0_axi_bresp = 2'b00; m0_axi_bvalid = 1'b0;
+                m0_axi_rid = 5'h0; m0_axi_rdata = 128'h0; m0_axi_rresp = 2'b00; m0_axi_rlast = 1'b1; m0_axi_rvalid = 1'b0;
+                m1_axi_bid = 4'h0; m1_axi_bresp = 2'b00; m1_axi_bvalid = 1'b0;
+                m1_axi_rid = 5'h0; m1_axi_rdata = 128'h0; m1_axi_rresp = 2'b00; m1_axi_rlast = 1'b1; m1_axi_rvalid = 1'b0;
+                m2_axi_bid = 4'h0; m2_axi_bresp = 2'b00; m2_axi_bvalid = 1'b0;
+                m2_axi_rid = 5'h0; m2_axi_rdata = 128'h0; m2_axi_rresp = 2'b00; m2_axi_rlast = 1'b1; m2_axi_rvalid = 1'b0;
+                m3_axi_bid = 4'h0; m3_axi_bresp = 2'b00; m3_axi_bvalid = 1'b0;
+                m3_axi_rid = 5'h0; m3_axi_rdata = 128'h0; m3_axi_rresp = 2'b00; m3_axi_rlast = 1'b1; m3_axi_rvalid = 1'b0;
             end
         endcase
     end

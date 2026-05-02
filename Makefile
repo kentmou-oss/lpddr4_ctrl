@@ -65,20 +65,20 @@ all: build
 verilator_sim: verilator_deps
 	@echo "Building with Verilator..."
 	$(VERILATOR) $(VERILATOR_OPTS) \
-		-o lpddr4_verilator_sim \
+		--Mdir obj_dir -o Vlpddr4_sim_tb \
 		tb/main.cpp \
-		$(TB_SIM) $(TB_MODEL) $(TB_TG) \
+		$(TB_SIM) $(TB_MODEL) $(TB_TG) tb/dfi_responder.sv \
 		$(RTL_SOURCES)
-	@echo "Build complete. Run with: ./lpddr4_verilator_sim"
+	@echo "Build complete. Run with: ./obj_dir/Vlpddr4_sim_tb"
 
 verilator_run: verilator_sim
 	@echo "Running Verilator simulation..."
-	./lpddr4_verilator_sim
+	./obj_dir/Vlpddr4_sim_tb
 
 verilator_wave: verilator_sim
 	@echo "Running with waveform dump..."
-	./lpddr4_verilator_sim +vcdplus+on
-	$(GTKWAVE) lpddr4_sim.vcd &
+	./obj_dir/Vlpddr4_sim_tb +vcdplus+on
+	$(GTKWAVE) lpddr4_sim.fst &
 
 verilator_clean:
 	rm -rf lpddr4_verilator_sim obj_dir

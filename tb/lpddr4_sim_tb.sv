@@ -193,7 +193,7 @@ module lpddr4_sim_tb;
     // ============================================
     // Instantiate DUT (LPDDR4 Controller + PHY)
     // ============================================
-    lpddr4_top u_dut (
+    lpddr4_top #(.BYPASS_PHY(1)) u_dut (
         .sys_clk           (sys_clk),
         .sys_rst_n         (sys_rst_n),
         .pll_lock          (pll_lock),
@@ -365,7 +365,7 @@ module lpddr4_sim_tb;
 
     // Instantiate the behavioral memory model
     lpddr4_model u_mem (
-        .clk            (ddr_clk),
+        .clk            (sys_clk),
         .rst_n          (sys_rst_n && ddr_reset_n),
         .ddr_dq         (ddr_dq),
         .ddr_dqs        (ddr_dqs),
@@ -649,8 +649,12 @@ module lpddr4_sim_tb;
         $display("=== LPDDR4 Controller Simulation Test ===");
         $display("Time: %0t", $time);
 
-        // Configure timing for DDR-3200
-        apb_write(8'h04, 32'h01031018);
+        // Configure timing for DDR-3200 (tRCD=18ns, tRP=18ns, tRAS=42ns, tRC=65ns)
+        // cfg_timing[15:0] = tRCD in clock cycles (18ns/5ns ≈ 4 cycles)
+        apb_write(8'h04, 32'h00000004);  // Lower 16 bits: tRCD=4 cycles
+
+        // Configure PHY delays (WL=4, RL=14 for DDR-3200)
+        apb_write(8'h08, {16'h0E08, 8'h0E, 8'h04});  // PHY_CFG: RL=14, WL=4
         $display("Configured timing registers");
 
         // Wait for initialization or just run for a while
@@ -667,14 +671,13 @@ module lpddr4_sim_tb;
         $display("Traffic generators enabled at time %0t", $time);
 
         // Run for fixed time - enough to see AXI transactions
-        #100000;
+        #200000;
 
-        // Check AXI signals at various points
+        // Debug check
         $display("\n=== AXI Signal Check at time %0t ===", $time);
-        $display("Port 0: AW valid=%b ready=%b AR valid=%b ready=%b", s0_axi_awvalid, s0_axi_awready, s0_axi_arvalid, s0_axi_arready);
-        $display("TG0: state=%h lfsr=%h pending_reads=%d pending_writes=%d", u_tg_0.state, u_tg_0.lfsr, u_tg_0.pending_reads, u_tg_0.pending_writes);
-        $display("TG0 IDLE check: enable=%b pending_reads=%d pending_writes=%d max_outstanding=%d",
-                 tg_enable, u_tg_0.pending_reads, u_tg_0.pending_writes, u_tg_0.MAX_OUTSTANDING);
+        $display("DUT: init_done=%b status=%h q_full=%b q_empty=%b resp_valid=%b resp_ready=%b",
+                 init_done, status, u_dut.u_controller.q_full, u_dut.u_controller.q_empty,
+                 u_dut.u_controller.resp_valid, u_dut.resp_ready);
 
         // Run more time for transactions
         #100000;

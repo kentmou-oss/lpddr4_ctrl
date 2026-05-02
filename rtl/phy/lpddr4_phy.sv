@@ -49,10 +49,8 @@ module lpddr4_phy (
     logic ck_enable;
     logic ck_gate;
 
-    // CA shift register
-    logic [9:0] ca_shreg;
+    // CA load signal
     logic       ca_load;
-    logic [3:0] ca_cnt;
 
     // DQ/DQS I/O buffers
     logic [31:0] dq_out;
@@ -126,40 +124,25 @@ module lpddr4_phy (
     end
     assign ddr_reset_n = init_reset_n;
 
-    // CA shift register
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            ca_shreg <= 10'h3FF;
-            ca_cnt <= 4'h0;
-        end else begin
-            if (ca_load) begin
-                ca_shreg <= dfi_ca;
-                ca_cnt <= 4'h0;
-            end else if (ca_cnt < 4'd9) begin
-                ca_shreg <= {1'b1, ca_shreg[9:1]};
-                ca_cnt <= ca_cnt + 1;
-            end
-        end
-    end
-
-    // CA output registered
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            ddr_ca <= 10'h3FF;
-        end else begin
-            ddr_ca <= ca_shreg[0] ? 10'h3FF : ca_shreg;
-        end
-    end
-
-    // Generate CA load signal
+    // CA path: register dfi_ca to ddr_ca with 1-cycle delay
+    // ca_load pulses on rising edge of ca_strobe (new valid command)
     logic ca_strobe;
+    logic ca_strobe_d;
     assign ca_strobe = (dfi_ca != 10'h3FF);
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             ca_load <= 1'b0;
+            ca_strobe_d <= 1'b0;
+            ddr_ca <= 10'h3FF;
         end else begin
-            ca_load <= ca_strobe;
+            ca_strobe_d <= ca_strobe;
+            ca_load <= ca_strobe && !ca_strobe_d;
+            // Pass command through when valid, otherwise NOP
+            if (ca_strobe)
+                ddr_ca <= dfi_ca;
+            else
+                ddr_ca <= 10'h3FF;
         end
     end
 
@@ -238,42 +221,54 @@ module lpddr4_phy (
     endgenerate
 
     // Read data path - deserialization 1:4 (DDR to 4x SDR)
+    // Capture from DDR DQ when read gate is open (!dqs_gate)
+    logic [1:0] read_gate_sync;  // sync to clk_4x
+    always_ff @(posedge clk_4x) begin
+        read_gate_sync <= {read_gate_sync[0], read_gate_open};
+    end
+
     always_ff @(posedge clk_4x) begin
         if (!rst_n) begin
             deser_cnt <= 4'h0;
             for (int i = 0; i < 8; i++) dq_deser[i] <= 4'h0;
             rd_data_buf <= 32'h0;
         end else begin
-            if (dqs_gate_early) begin
-                deser_cnt <= 4'h0;
+            // Trigger deserialization when read gate opens (sync'd) or during training
+            if (dqs_gate_early || (read_gate_sync[1] && deser_cnt == 4'h0)) begin
+                deser_cnt <= 4'h1;
                 for (int i = 0; i < 8; i++) begin
                     dq_deser[i] <= dq_in[i*4 +: 4];
                 end
-            end else if (deser_cnt < (SER_BITS-1)) begin
+            end else if (deser_cnt > 0 && deser_cnt < SER_BITS) begin
                 deser_cnt <= deser_cnt + 1;
                 for (int i = 0; i < 8; i++) begin
                     dq_deser[i] <= {dq_in[i*4 +: 4], dq_deser[i][SER_BITS-1:1]};
                 end
-            end else if (deser_cnt == (SER_BITS-1)) begin
+            end else if (deser_cnt == SER_BITS) begin
                 rd_data_buf <= {
                     dq_deser[7], dq_deser[6], dq_deser[5], dq_deser[4],
                     dq_deser[3], dq_deser[2], dq_deser[1], dq_deser[0]
                 };
+                deser_cnt <= 4'h0;
             end
         end
     end
 
-    // DQS gating for read
+    // DQS gating for read - open gate when read data expected
+    logic read_gate_open;
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            dqs_gate <= 4'hF;
+            dqs_gate <= 4'hF;  // gated (disabled)
+            read_gate_open <= 1'b0;
         end else begin
             dqs_gate_early <= training_en && (training_type == 4'h4);
-            if (dqs_gate_early) begin
-                dqs_gate <= 4'h0;
+            // Open read gate during read latency countdown (data expected soon)
+            if (ca_load && (dfi_ca[1:0] == 2'b01)) begin
+                read_gate_open <= 1'b1;
             end else if (rddata_en) begin
-                dqs_gate <= 4'hF;
+                read_gate_open <= 1'b0;
             end
+            dqs_gate <= read_gate_open ? 4'h0 : 4'hF;
         end
     end
 
@@ -290,31 +285,21 @@ module lpddr4_phy (
     assign dfi_rddata = rd_data_buf;
     assign dfi_rddata_en = rddata_en;
 
-    // Read latency tracking
+    // Read latency tracking - detect READ command from CA bus via ca_load pulse
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             rddata_en <= 1'b0;
             rddata_cnt <= 4'h0;
         end else begin
             rddata_en <= 1'b0;
-            if (rddata_cnt > 0) begin
+            // Start latency counter when READ command is issued (ca_load pulses)
+            if (ca_load && (dfi_ca[1:0] == 2'b01)) begin
+                rddata_cnt <= cfg_rl[3:0];
+            end else if (rddata_cnt > 0) begin
                 rddata_cnt <= rddata_cnt - 1;
                 if (rddata_cnt == 1) begin
                     rddata_en <= 1'b1;
                 end
-            end
-        end
-    end
-
-    // Start read data counting after read command
-    logic prev_dfi_rddata_en;
-    always_ff @(posedge clk) begin
-        prev_dfi_rddata_en <= dfi_rddata_en;
-        if (!rst_n) begin
-            rddata_cnt <= 4'h0;
-        end else begin
-            if (prev_dfi_rddata_en && !dfi_rddata_en && (dfi_ca[1:0] == 2'b01)) begin
-                rddata_cnt <= cfg_rl[3:0];
             end
         end
     end

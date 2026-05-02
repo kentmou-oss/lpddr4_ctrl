@@ -1,0 +1,18 @@
+# verilator
+obj_dir/
+*.vcd
+*.log
+*.o
+*.d
+*.a
+
+# build
+build/
+out/
+
+# mac
+.DS_Store
+
+# claude local config
+CLAUDE.local.md
+.claude/settings.local.json

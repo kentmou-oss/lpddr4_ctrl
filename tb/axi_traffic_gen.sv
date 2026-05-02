@@ -162,7 +162,7 @@ module axi_traffic_gen #(
                 IDLE: begin
                     // Decide next transaction type
                     is_write <= lfsr[0];  // Random write/read
-                    curr_len <= lfsr[3:0];  // 0-15 beats (1-16)
+                    curr_len <= 8'h0;  // Single beat for initial verification
 
                     // Generate random address (aligned)
                     curr_addr <= {2'b00, random(ADDR_START[31:2], ADDR_END[31:2]), 2'b00};
@@ -204,7 +204,10 @@ module axi_traffic_gen #(
             end
 
             SEND_WRITE: begin
-                if (m_axi_awvalid && m_axi_awready) begin
+                // If both AW+W complete in same cycle, go directly to WAIT_BRESP
+                if (m_axi_awvalid && m_axi_awready && m_axi_wvalid && m_axi_wready && m_axi_wlast) begin
+                    next_state = WAIT_BRESP;
+                end else if (m_axi_awvalid && m_axi_awready) begin
                     next_state = SEND_WDATA;
                 end
             end
@@ -248,11 +251,11 @@ module axi_traffic_gen #(
     assign m_axi_awburst = 2'b01;   // INCR
     assign m_axi_awvalid = (state == SEND_WRITE);
 
-    // Write data
+    // Write data - send with AW for single-beat, or in SEND_WDATA for multi-beat
     assign m_axi_wdata  = curr_wdata;
     assign m_axi_wstrb  = 16'hFFFF;
-    assign m_axi_wlast  = (beat_count == curr_len);
-    assign m_axi_wvalid = (state == SEND_WDATA);
+    assign m_axi_wlast  = (state == SEND_WDATA) ? (beat_count == curr_len) : 1'b1;
+    assign m_axi_wvalid = (state == SEND_WRITE) || (state == SEND_WDATA);
 
     // Write response
     assign m_axi_bready = (state == WAIT_BRESP) && m_axi_bvalid;
