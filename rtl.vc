@@ -1,0 +1,8 @@
+rtl/top/lpddr4_top.sv
+rtl/phy/lpddr4_phy.sv
+rtl/controller/lpddr4_controller.sv
+rtl/axi_slave/axi_crossbar.sv
+rtl/axi_slave/axi_slave_if.sv
+rtl/axi_slave/axi_outstanding_tracker.sv
+rtl/training/lpddr4_training.sv
+rtl/common/lpddr4_common.sv
